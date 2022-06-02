@@ -1,0 +1,2 @@
+#!/bin/sh
+curl -LsS https://api.mullvad.net/public/relays/wireguard/v1/ | jq  '.'

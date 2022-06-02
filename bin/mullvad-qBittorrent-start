@@ -1,0 +1,200 @@
+#!/bin/bash
+
+#
+# settings 
+#
+ACCOUNT="XXXXXXXXXXXXXXXX"
+PUBKEY="XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+export ACCOUNT
+export PUBKEY
+export CITY
+export CITYCODE
+export TOKEN
+
+
+function getToken() {
+	local ACCOUNT="$1"
+
+	local RESPONSE=$(curl 'https://api.mullvad.net/www/accounts/'$ACCOUNT'/' \
+		-s \
+		-H 'Accept: application/json' \
+		--compressed \
+	)
+	local TOKEN=$(echo "$RESPONSE" | jq .auth_token | cut -d'"' -f2 | head -n1 )
+	if [ -z "$TOKEN" ] || [ "$TOKEN" == "null" ]; then
+		return 1
+	fi
+	echo $TOKEN
+	return 0
+}
+
+function expireToken() {
+	local TOKEN="$1"
+
+	curl 'https://api.mullvad.net/www/expire-auth-token/' \
+		-s \
+		-X POST \
+		-H 'Accept: application/json' \
+		-H "Authorization: Token ${TOKEN}" \
+		--compressed
+}
+
+function getCity() {
+	local TOKEN="$1"
+
+	local RESPONSE=$(curl 'https://ipv4.am.i.mullvad.net/json' \
+		-s \
+	       	-H 'Accept: application/json' \
+		--compressed \
+	)
+	local CITY=$(echo "$RESPONSE" | jq .city | cut -d'"' -f2 | head -n1 |cut -d' ' -f1 |sed 's/ü/u/g')
+	if [ -z "$CITY" ] || [ "$CITY" == "null" ]; then
+		return 1
+	fi
+	local CITYCODE
+	local RESPONSE=$(curl 'https://api.mullvad.net/www/cities/' \
+		-s \
+		-H 'Accept: application/json' \
+		-H "Authorization: Token ${TOKEN}" \
+		--compressed
+	)
+	local CITYCODE=$(echo "$RESPONSE" | jq '.[] | select(.name=="'"$CITY"'") | .code' | cut -d'"' -f2 | head -n1 )
+	if [ -z "$CITYCODE" ] || [ "$CITYCODE" == "null" ]; then
+		return 1
+	fi
+
+	echo $CITYCODE
+	return 0
+}
+
+function getCityCode() {
+	local TOKEN="$1"
+
+	local RESPONSE=$(curl 'https://ipv4.am.i.mullvad.net/json' \
+		-s \
+	       	-H 'Accept: application/json' \
+		--compressed \
+	)
+	local CITY=$(echo "$RESPONSE" | jq .mullvad_exit_ip_hostname | cut -d'"' -f2 | head -n1)
+	if [ -z "$CITY" ] || [ "$CITY" == "null" ]; then
+		return 1
+	fi
+	local CITYCODE
+	local RESPONSE=$(curl 'https://api.mullvad.net/public/relays/wireguard/v1/' \
+		-s \
+		-H 'Accept: application/json' \
+		-H "Authorization: Token ${TOKEN}" \
+		--compressed | tee /tmp/xx
+	)
+
+	local CITYCODE=$(echo "$RESPONSE" | jq '.[] | select(.hostname=="'"$CITY"'") | .code' | cut -d'"' -f2 | head -n1 )
+	exit;
+	if [ -z "$CITYCODE" ] || [ "$CITYCODE" == "null" ]; then
+		return 1
+	fi
+
+	echo $CITYCODE
+	return 0
+}
+
+function addPort() {
+	local TOKEN="$1"
+	local PUBKEY="$2"
+	local CITY="$3"
+
+	local RESPONSE=$(curl 'https://api.mullvad.net/www/ports/add/' \
+		-s \
+		-X POST \
+		-H 'Accept: application/json' \
+		--compressed \
+		-H 'Content-Type: application/json' \
+		-H "Authorization: Token ${TOKEN}" \
+		--data-raw '{"pubkey":"'$PUBKEY'","city_code":"'$CITY'"}' \
+	)
+	local PORT=$(echo "$RESPONSE" | jq .port | cut -d'"' -f2 | head -n1 )
+	if [ -z "$PORT" ] || [ "$PORT" == "null" ]; then
+		return 1
+	fi
+	echo $PORT
+	return 0
+}
+
+function removePort() {
+	local TOKEN="$1"
+	local CITY="$2"
+	local PORT=$3
+
+	curl 'https://api.mullvad.net/www/ports/remove/' \
+		-s \
+		-X POST \
+		-H 'Accept: application/json' \
+		--compressed \
+		-H 'Content-Type: application/json' \
+		-H "Authorization: Token ${TOKEN}" \
+		--data-raw '{"port":'$PORT',"city_code":"'$CITY'"}'
+}
+
+# on exit remove port mapping
+function cleanup() {
+	local CITY="$1"
+	local PORT="$2"
+
+	if [ -z "$PORT" ]; then
+		exit 0
+	fi
+	echo Remove forwarding for port $PORT.
+	local TOKEN=$(getToken $ACCOUNT) || exit 1
+	removePort $TOKEN $CITY $PORT
+	expireToken $TOKEN
+	exit 0
+}
+
+#
+# Main code
+#
+
+# check Account
+if [ "$ACCOUNT" == "XXXXXXXXXXXXXXXX" ] || [ "$PUBKEY" ="XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" ] ; then
+	echo "Please set ACCOUNT and PUBKEY variable."
+	exit 1
+fi
+
+# check for required binaries
+if ! which curl >/dev/null 2>&1 || ! which jq >/dev/null 2>&1; then
+	echo "Please install curl and jq."
+	exit 1
+fi
+
+TOKEN=$(getToken $ACCOUNT) || {
+	echo Failed to get token for account $ACCOUNT, return code: $?.
+	expireToken $TOKEN
+	exit 1
+}
+CITYCODE=$(getCity $TOKEN) || {
+	echo Cannot detect city $CITYCODE.
+	expireToken $TOKEN
+	exit 1
+}
+
+export PORT=$(addPort $TOKEN $PUBKEY $CITYCODE) || {
+	echo "Cannot create Portmapping $CITYCODE with pubkey $PUBKEY. Result: $PORT, return code: $?"
+	expireToken $TOKEN
+	exit 1
+}
+echo "Created forwarding for port $PORT in $CITYCODE."
+
+# add trap for cleanup
+trap "cleanup $CITYCODE $PORT" SIGTERM SIGQUIT SIGINT SIGKILL
+# cleanup token
+expireToken $TOKEN
+
+# set listening port in configuration
+echo "Modify qBittorrent config for port $PORT."
+perl -pi -e 's/^Connection\\PortRangeMin=.*/Connection\\PortRangeMin='${PORT}'/g' ~/.config/qBittorrent/qBittorrent.conf
+
+# start qbittorrent
+echo "Start qBittorrent."
+trap "cleanup $CITYCODE $PORT" SIGTERM SIGQUIT SIGINT SIGKILL SIGCHLD
+qbittorrent
+
